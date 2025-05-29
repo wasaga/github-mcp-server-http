@@ -14,6 +14,7 @@ import (
 	"github.com/github/github-mcp-server/pkg/translations"
 	gogithub "github.com/google/go-github/v69/github"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/shurcooL/githubv4"
 )
 
 var version = "version"
@@ -31,24 +32,17 @@ func run(ctx context.Context) error {
 	ghServer := githubmcp.NewServer(version)
 
 	t, _ := translations.TranslationHelper()
-	toolsets, err := githubmcp.InitToolsets(nil, true, GetClient, t)
+	toolsets, err := githubmcp.InitToolsets(nil, true, getRESTClient, getGQLClient, t)
 	if err != nil {
 		return fmt.Errorf("failed to initialize toolsets: %w", err)
 	}
 
-	ct := githubmcp.InitContextToolset(GetClient, t)
-	githubmcp.RegisterResources(ghServer, GetClient, t)
+	ct := githubmcp.InitContextToolset(getRESTClient, t)
+	githubmcp.RegisterResources(ghServer, getRESTClient, t)
 	toolsets.RegisterTools(ghServer)
 	ct.RegisterTools(ghServer)
 
-	serverURL := os.Getenv("GITHUB_MCP_SERVER_URL")
-	if serverURL == "" {
-		return fmt.Errorf("GITHUB_MCP_SERVER_URL not set")
-	}
-	sseServer := server.NewSSEServer(ghServer,
-		server.WithBaseURL(serverURL),
-		server.WithSSEContextFunc(tokenFromRequest),
-	)
+	server := server.NewStreamableHTTPServer(ghServer, server.WithHTTPContextFunc(tokenFromRequest))
 
 	port, ok := os.LookupEnv("PORT")
 	if !ok {
@@ -62,9 +56,9 @@ func run(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		log.Println("Shutting down server...")
-		_ = sseServer.Shutdown(ctx)
+		_ = server.Shutdown(ctx)
 	}()
-	return sseServer.Start(addr)
+	return server.Start(addr)
 }
 
 type authKey struct{}
@@ -89,7 +83,7 @@ func tokenFromContext(ctx context.Context) (string, error) {
 	return auth, nil
 }
 
-func GetClient(ctx context.Context) (*gogithub.Client, error) {
+func getRESTClient(ctx context.Context) (*gogithub.Client, error) {
 	token, err := tokenFromContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token from context: %w", err)
@@ -98,4 +92,30 @@ func GetClient(ctx context.Context) (*gogithub.Client, error) {
 	client := gogithub.NewClient(nil).WithAuthToken(token)
 
 	return client, nil
+}
+
+func getGQLClient(ctx context.Context) (*githubv4.Client, error) {
+	token, err := tokenFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token from context: %w", err)
+	}
+
+	client := &http.Client{
+		Transport: &bearerAuthTransport{
+			transport: http.DefaultTransport,
+			token:     token,
+		},
+	}
+	return githubv4.NewEnterpriseClient("https://api.github.com/graphql", client), nil
+}
+
+type bearerAuthTransport struct {
+	transport http.RoundTripper
+	token     string
+}
+
+func (t *bearerAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer "+t.token)
+	return t.transport.RoundTrip(req)
 }
